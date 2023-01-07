@@ -1,0 +1,148 @@
+#!/bin/bash
+set -eo pipefail
+
+PROGNAME=$(basename $0) # split_ldif_records
+
+# DEFAULTS
+LDAP_HOST='LDAP-EQX-LB.example.net'
+BIND_DN='CN=David Sun,OU=Americas,OU=Users,OU=Corp,DC=example,DC=net'
+BIND_PASS=''
+BASE_DN='DC=example,DC=net'
+LDAP_FILTER='(&(sAMAccountType=805306368)(userAccountControl=*))'
+ATTRIBUTES=(co department displayName \
+    employeeType sAMAccountName title \
+    userAccountControl userPrincipalName)
+OUTPUT_DIR='/home/sund/code/scripts/tmp/users'
+
+# https://docs.microsoft.com/en-us/windows/win32/adschema/a-samaccounttype
+# SAM_NORMAL_USER_ACCOUNT 0x30000000
+# SAM_MACHINE_ACCOUNT 0x30000001
+
+
+# CLEANUP
+function err_report() {
+    lineno=$1
+    echo "$(date --utc --iso-8601='minutes') - Error on line $lineno" >&2
+}
+
+# trap "rm -f $OUTPUT_DIR/$LDIF_FILE" EXIT
+trap 'err_report $LINENO $BASH_COMMAND' ERR
+
+function usage() {
+cat <<-EOF
+Usage: $PROGNAME [options] [attributes...]
+
+Description:
+    '$PROGNAME' retrieves a subset of LDAP attributes about users (via the ldapsearch command) 
+    and splits them into LDIF files on a per user basis. This is to conserve bandwith and 
+    calls to the LDAP server by retrieiving user via paged records vs 1 x N users. 
+
+    Alternatively a user can supply an LDIF file and begin parsing.
+
+Example:
+    $PROGNAME --ldif-file existing_users.ldif --output-dir /tmp/ldif_records/$(date --iso-8601)/
+
+    $PROGNAME \\
+        --ldap-host ldap.example.corp \\
+        --bind-dn svcacct@example.corp \\
+        --bind-pass svcpassword \\
+        --base-dn 'OU=Users,DC=example,DC=corp' \\
+        --ldap-filter '(&(sAMAccountType=805306368)(userAccountControl=*))' \\
+        --output-dir /tmp/ldif_records/$(date --iso-8601)/ \\
+        --attributes
+        co department displayName \\
+        employeeType sAMAccountName title \\
+        userAccountControl userPrincipalName 
+    
+Options:
+    --ldif-file     LDIF_FILE    Source LDIF file. If this option is provided, script will not reach out to 
+                                    LDAP server to retrieve LDIF records
+    --ldap-host     LDAP_HOST    LDAP Server
+    --bind-dn       BIND_DN      Bind DN (someone@example.corp or 'CN=somone,OU=Users,DC=example,DC=corp')
+    --bind-pass     BIND_PASS    Bind Password (clear text)
+    --base-dn       BASE_DN      Base DN for search
+    --ldap-filter   LDAP_FILTER  RFC 4515 compliant LDAP search filter - 
+                                    default=((&(sAMAccountType=805306368)(userAccountControl=*)))
+    --output-dir    OUTPUT_DIR   Output directory
+    --debug         DEBUG        Verbose debugging 'set -x'
+
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case $1 in 
+    -h|--help) 
+        usage
+        exit
+        ;;
+    --ldif-file)
+        LDIF_FILE="$2"
+        shift;shift;
+        ;;
+    --ldap-host)
+        LDAP_HOST="$2"
+        shift; shift; # pop args + value
+        ;;
+    --bind-dn)
+        BIND_DN="$2"
+        shift; shift;
+        ;;
+    --bind-pass)
+        BIND_PASS="$2"
+        shift;shift;
+        ;;
+    --base-dn)
+        BASE_DN="$2"
+        shift;shift;
+        ;;
+    --ldap-filter)
+        LDAP_FILTER="$2"
+        shift;shift;
+        ;; 
+    --output-dir)
+        OUTPUT_DIR="$2"
+        shift;shift;
+        ;;
+    --debug)
+        set -x
+        shift;
+        ;;
+    --*)
+        echo "Invalid option - '$1'"
+        usage
+        exit 1
+        ;;
+    *)
+        ATTRIBUTES+=($1)
+        shift
+        ;;
+  esac
+done
+
+if [ -z "$LDIF_FILE" ]; then
+    LDIF_FILE='tmp_users.ldif'
+    ldapsearch -LLL -ZZ -H  ldap://$LDAP_HOST \
+    -D "$BIND_DN" \
+    -W -b "$BASE_DN" -o ldif-wrap=no -E pr=1000/noprompt \
+    -s sub "$LDAP_FILTER"  ${ATTRIBUTES[@]} | \
+    sed -e '/^# pagedresults: */d;/^# refldap:.*$/d;' | sed '/^$/N;/^\n$/D'  > $LDIF_FILE
+fi
+
+csplit $LDIF_FILE '/dn:.*/' '{*}' -f $OUTPUT_DIR/ldif- -z --quiet
+
+# regular accounts
+grep -r 'sAMAccountName: ' $OUTPUT_DIR/ldif-* --with-filename | sed 's/sAMAccountName: //g' |
+awk -F ':' '{ print $1, $2 }' |
+while read -r OUTFILE ACCTNAME; do
+    mv $OUTFILE "$OUTPUT_DIR/$ACCTNAME.ldif"
+    sed -i '/^$/d' "$OUTPUT_DIR/$ACCTNAME.ldif"
+done
+
+# base64 encoded accounts
+grep -r 'sAMAccountName:: ' $OUTPUT_DIR/ldif-* --with-filename | sed 's/sAMAccountName:: //g' | 
+awk -F ':' '{print $1, $2}' | 
+while read -r OUTFILE BASE64_ACCTNAME; do
+    DECODED_ACCTNAME=$(echo "$BASE64_ACCTNAME" | base64 -d | sed -e 's/\$/\\$/g' )
+    mv $OUTFILE "$OUTPUT_DIR/$DECODED_ACCTNAME.ldif"
+    sed -i '/^$/d' "$OUTPUT_DIR/$DECODED_ACCTNAME.ldif"   
+done 
